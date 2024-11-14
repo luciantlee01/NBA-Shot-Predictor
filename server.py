@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import math
 from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -223,9 +224,9 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
             logger.info(f"Removed connection for game {game_id}")
 
 # Add a test data endpoint
-@app.post("/api/test/game-update/{game_id}")
+@app.post("/api/test/create/{game_id}")
 async def create_test_data(game_id: str):
-    """Create test data for a given game ID"""
+    """Create test data with defined player roles"""
     try:
         if not redis_client:
             raise HTTPException(status_code=503, detail="Redis connection not available")
@@ -238,100 +239,162 @@ async def create_test_data(game_id: str):
                 "game_clock": 720.0,
                 "quarter": 1,
                 "score_home": 0,
-                "score_away": 0
+                "score_away": 0,
+                "last_action": "Game started"
             },
             "player_positions": [
                 {
-                    "player_id": "p1",
-                    "x": 0.0,  # Center court
-                    "y": 23.5,  # Half-court
+                    "player_id": "PG",
+                    "role": "PG",
+                    "x": 0.0,
+                    "y": 30.0,
                     "velocity_x": 0.0,
                     "velocity_y": 0.0,
-                    "team_id": "team1"
+                    "team_id": "team1",
+                    "is_shooting": False,
+                    "shot_made": False
                 },
                 {
-                    "player_id": "p2",
-                    "x": -10.0,  # Left side
-                    "y": 35.0,
+                    "player_id": "SG",
+                    "role": "SG",
+                    "x": -15.0,
+                    "y": 25.0,
                     "velocity_x": 0.0,
                     "velocity_y": 0.0,
-                    "team_id": "team1"
+                    "team_id": "team1",
+                    "is_shooting": False,
+                    "shot_made": False
                 },
                 {
-                    "player_id": "p3",
-                    "x": 10.0,  # Right side
-                    "y": 35.0,
+                    "player_id": "C",
+                    "role": "C",
+                    "x": 0.0,
+                    "y": 10.0,
                     "velocity_x": 0.0,
                     "velocity_y": 0.0,
-                    "team_id": "team1"
+                    "team_id": "team1",
+                    "is_shooting": False,
+                    "shot_made": False
                 }
             ]
         }
 
-        # Store in Redis
         await redis_client.set(f"game_state:{game_id}", json.dumps(test_data))
-        
-        # Broadcast to connected clients
         await broadcast_update(game_id, test_data)
         
         return {"status": "success", "message": "Test data created"}
     except Exception as e:
         logger.error(f"Error creating test data: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/test/simulate-update/{game_id}")
+    
+@app.post("/api/test/simulate/{game_id}")
 async def simulate_game_update(game_id: str):
-    """Simulate a game update with random changes and better boundary constraints"""
+    """Simulate a game update with basketball-specific movement patterns"""
     try:
         if not redis_client:
             raise HTTPException(status_code=503, detail="Redis connection not available")
 
-        # Get current game state
         current_state = await get_game_state(game_id)
         if not current_state:
             raise HTTPException(status_code=404, detail="Game not found")
 
-        # Update game state with some changes
         game_state = current_state["game_state"]
+        player_positions = current_state["player_positions"]
+
+        # Update game state
         game_state["timestamp"] = datetime.now().isoformat()
         game_state["shot_clock"] = max(0, float(game_state["shot_clock"]) - 2.4)
         game_state["game_clock"] = max(0, float(game_state["game_clock"]) - 24.0)
-        game_state["score_home"] = int(game_state["score_home"]) + 2
 
-        # Update player positions with better boundary constraints
-        player_positions = current_state["player_positions"]
+        # First, clear any previous shooting states
         for player in player_positions:
-            # Calculate potential new position
-            new_x = player["x"] + random.uniform(-3, 3)  # Reduced movement range
-            new_y = player["y"] + random.uniform(-3, 3)  # Reduced movement range
+            player["is_shooting"] = False
+            player["shot_made"] = False
+
+        # Simulate basketball play patterns
+        shooting_chance = random.random()
+        if shooting_chance > 0.7:  # 30% chance of shot attempt
+            # Choose a random player to shoot
+            shooter = random.choice(player_positions)
             
-            # Constrain x position (court width)
-            new_x = max(-23, min(23, new_x))  # Slightly inside the sidelines
+            # Calculate shot probability based on position
+            distance_to_basket = math.sqrt(shooter["x"]**2 + (shooter["y"] - 5.5)**2)
+            is_three_pointer = distance_to_basket > 23.75  # NBA 3-point line
             
-            # Constrain y position (court length)
-            new_y = max(2, min(45, new_y))  # Keep players away from baselines
+            # Base probability affected by distance
+            shot_probability = max(0.2, 1 - (distance_to_basket / 50))
             
-            # Update position and velocity
-            player["x"] = new_x
-            player["y"] = new_y
-            player["velocity_x"] = random.uniform(-1, 1)  # Reduced velocity
-            player["velocity_y"] = random.uniform(-1, 1)  # Reduced velocity
+            # Simulate shot
+            shot_made = random.random() < shot_probability
+            
+            # Set shooting status for the shooter
+            shooter["is_shooting"] = True
+            shooter["shot_made"] = shot_made
+            
+            if shot_made:
+                game_state["score_home"] += 3 if is_three_pointer else 2
+                game_state["last_action"] = f"Player {shooter['player_id']} made a {'3-point' if is_three_pointer else '2-point'} shot!"
+            else:
+                game_state["last_action"] = f"Player {shooter['player_id']} missed a {'3-point' if is_three_pointer else '2-point'} shot!"
+        else:
+            game_state["last_action"] = "Players moving..."
+
+        # Update player positions with role-based movement
+        for player in player_positions:
+            # Skip movement if player is shooting
+            if player.get("is_shooting", False):
+                continue
+
+            role = player.get("role", "undefined")
+            
+            if role == "PG":  # Point Guard - handles the ball more
+                # Stay near top of key
+                target_x = random.uniform(-10, 10)
+                target_y = random.uniform(25, 35)
+            elif role == "SG":  # Shooting Guard - moves around perimeter
+                # Move around three-point line
+                angle = random.uniform(0, math.pi)
+                target_x = 22 * math.cos(angle)
+                target_y = 22 * math.sin(angle) + 15
+            elif role == "C":  # Center - stays near paint
+                # Stay in the paint area
+                target_x = random.uniform(-8, 8)
+                target_y = random.uniform(5, 15)
+            
+            # Calculate direction to target
+            dx = target_x - player["x"]
+            dy = target_y - player["y"]
+            distance = math.sqrt(dx**2 + dy**2)
+            
+            if distance > 0:
+                # Normalize and apply movement
+                speed = random.uniform(0.5, 2.0)
+                player["velocity_x"] = (dx / distance) * speed
+                player["velocity_y"] = (dy / distance) * speed
+                player["x"] += player["velocity_x"]
+                player["y"] += player["velocity_y"]
+            
+            # Ensure players stay in bounds
+            player["x"] = max(-23, min(23, player["x"]))
+            player["y"] = max(2, min(45, player["y"]))
 
         update = {
             "game_state": game_state,
             "player_positions": player_positions
         }
 
-        # Store in Redis
+        # Store in Redis and broadcast
         await redis_client.set(f"game_state:{game_id}", json.dumps(update))
-        
-        # Broadcast to connected clients
         await broadcast_update(game_id, update)
         
         return {"status": "success", "message": "Game updated"}
     except Exception as e:
         logger.error(f"Error simulating game update: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
 
 async def get_game_state(game_id: str) -> Optional[Dict]:
     """Get game state from Redis with error handling"""
@@ -345,8 +408,8 @@ async def get_game_state(game_id: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Error retrieving game state: {str(e)}")
         return None
-    
-HTML_TEMPLATE = """
+
+HTML_TEMPLATE = """"
 <!DOCTYPE html>
 <html>
 <head>
@@ -404,6 +467,8 @@ HTML_TEMPLATE = """
             border-radius: 4px;
             border: 1px solid #ddd;
         }
+
+        /* Game visualization styles */
         .court-container {
             margin: 20px 0;
             padding: 20px;
@@ -441,35 +506,58 @@ HTML_TEMPLATE = """
             height: 400px;
             border: 2px solid #333;
             position: relative;
-            background: #fff;
-        }
-        
-        .player-marker {
-            position: absolute;
-            width: 20px;
-            height: 20px;
-            background: blue;
-            border-radius: 50%;
-            transform: translate(-50%, -50%);
-            transition: all 0.3s ease;
-        }
-        
-        .velocity-vector {
-            position: absolute;
-            height: 2px;
-            background: rgba(0, 0, 255, 0.5);
-            transform-origin: left center;
-        }
-        #basketball-court {
-            width: 100%;
-            height: 400px;
-            border: 2px solid #333;
-            position: relative;
             background: #f8f9fa;
             margin: 20px 0;
         }
         
-        /* Court markings */
+        .player-marker {
+            position: absolute;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            transition: all 0.3s ease;
+            z-index: 2;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* Player role colors */
+        .player-pg {
+            background: #ff4444;
+            border: 2px solid #cc0000;
+            box-shadow: 0 0 5px rgba(204, 0, 0, 0.5);
+        }
+
+        .player-sg {
+            background: #33b5e5;
+            border: 2px solid #0099cc;
+            box-shadow: 0 0 5px rgba(0, 153, 204, 0.5);
+        }
+
+        .player-c {
+            background: #aa66cc;
+            border: 2px solid #9933cc;
+            box-shadow: 0 0 5px rgba(153, 51, 204, 0.5);
+        }
+
+        .player-label {
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            text-shadow: 1px 1px 1px rgba(0,0,0,0.5);
+        }
+
+        .velocity-vector {
+            position: absolute;
+            height: 2px;
+            background: rgba(255, 255, 255, 0.7);
+            transform-origin: left center;
+            left: 50%;
+            top: 50%;
+        }
+
         .court-markings {
             position: absolute;
             width: 100%;
@@ -477,7 +565,6 @@ HTML_TEMPLATE = """
             pointer-events: none;
         }
         
-        /* Three-point line */
         .three-point-line {
             position: absolute;
             width: 80%;
@@ -489,7 +576,6 @@ HTML_TEMPLATE = """
             bottom: 0;
         }
         
-        /* Free throw line */
         .free-throw-line {
             position: absolute;
             width: 40%;
@@ -498,26 +584,65 @@ HTML_TEMPLATE = """
             left: 30%;
             top: 20%;
         }
-        
-        .player-marker {
+
+        .basket {
             position: absolute;
-            width: 20px;
-            height: 20px;
-            background: #2196F3;
-            border: 2px solid #1976D2;
+            width: 10px;
+            height: 10px;
+            background: #ff0000;
             border-radius: 50%;
-            transform: translate(-50%, -50%);
-            transition: all 0.3s ease;
-            z-index: 2;
+            bottom: 5px;
+            left: calc(50% - 5px);
         }
-        
-        .velocity-vector {
-            position: absolute;
-            height: 2px;
-            background: rgba(33, 150, 243, 0.5);
-            transform-origin: left center;
-            left: 50%;
-            top: 50%;
+
+        /* Enhanced shooting animations */
+        .shooting {
+            animation: pulse 0.8s infinite;
+        }
+
+        .shot-made {
+            box-shadow: 0 0 20px #4CAF50 !important;
+            animation: success-pulse 1s infinite !important;
+        }
+
+        .shot-missed {
+            box-shadow: 0 0 20px #f44336 !important;
+            animation: fail-pulse 1s infinite !important;
+        }
+
+        @keyframes pulse {
+            0% { transform: translate(-50%, -50%) scale(1); }
+            50% { transform: translate(-50%, -50%) scale(1.3); }
+            100% { transform: translate(-50%, -50%) scale(1); }
+        }
+        @keyframes success-pulse {
+            0% { 
+                transform: translate(-50%, -50%) scale(1);
+                box-shadow: 0 0 10px #4CAF50;
+            }
+            50% { 
+                transform: translate(-50%, -50%) scale(1.2);
+                box-shadow: 0 0 20px #4CAF50;
+            }
+            100% { 
+                transform: translate(-50%, -50%) scale(1);
+                box-shadow: 0 0 10px #4CAF50;
+            }
+        }
+
+        @keyframes fail-pulse {
+            0% { 
+                transform: translate(-50%, -50%) scale(1);
+                box-shadow: 0 0 10px #f44336;
+            }
+            50% { 
+                transform: translate(-50%, -50%) scale(1.2);
+                box-shadow: 0 0 20px #f44336;
+            }
+            100% { 
+                transform: translate(-50%, -50%) scale(1);
+                box-shadow: 0 0 10px #f44336;
+            }
         }
 
         .debug-info {
@@ -529,6 +654,14 @@ HTML_TEMPLATE = """
             white-space: pre-wrap;
         }
 
+        #last-action {
+            text-align: center;
+            padding: 10px;
+            font-weight: bold;
+            margin-top: 10px;
+            background: #f5f5f5;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body>
@@ -561,7 +694,6 @@ HTML_TEMPLATE = """
         <div id="test-data-status"></div>
     </div>
 
-    <!-- Remove the first court container and keep only this one -->
     <div class="court-container">
         <h2>Game Visualization</h2>
         <div class="game-stats">
@@ -582,16 +714,18 @@ HTML_TEMPLATE = """
                 <div class="stat-value" id="quarter">1</div>
             </div>
         </div>
+        
+        <div id="last-action">Game started</div>
+        
         <div id="basketball-court">
             <div class="court-markings">
                 <div class="three-point-line"></div>
                 <div class="free-throw-line"></div>
+                <div class="basket"></div>
             </div>
         </div>
         <div class="debug-info" id="debug-info"></div>
     </div>
-    
-
     <script>
         let ws = null;
         let reconnectAttempts = 0;
@@ -631,7 +765,7 @@ HTML_TEMPLATE = """
         async function createTestData() {
             const gameId = document.getElementById('game-id').value;
             try {
-                const response = await fetch(`/api/test/game-update/${gameId}`, {
+                const response = await fetch(`/api/test/create/${gameId}`, {  // Updated path
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -648,7 +782,7 @@ HTML_TEMPLATE = """
         async function simulateUpdate() {
             const gameId = document.getElementById('game-id').value;
             try {
-                const response = await fetch(`/api/test/simulate-update/${gameId}`, {
+                const response = await fetch(`/api/test/simulate/${gameId}`, {  // Updated path
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -660,6 +794,89 @@ HTML_TEMPLATE = """
                     `Error simulating update: ${error.message}`;
                 addMessage(`Failed to simulate update: ${error.message}`, true);
             }
+        }
+
+        function updateGameStats(gameState) {
+            document.getElementById('shot-clock').textContent = 
+                Number(gameState.shot_clock).toFixed(1);
+            document.getElementById('game-clock').textContent = 
+                Number(gameState.game_clock).toFixed(1);
+            document.getElementById('score-home').textContent = 
+                gameState.score_home;
+            document.getElementById('quarter').textContent = 
+                gameState.quarter;
+            
+            if (gameState.last_action) {
+                document.getElementById('last-action').textContent = gameState.last_action;
+            }
+        }
+
+        function updatePlayerPositions(players) {
+            const court = document.getElementById('basketball-court');
+            const existingMarkers = court.querySelectorAll('.player-marker');
+            existingMarkers.forEach(marker => marker.remove());
+            
+            const courtWidth = court.offsetWidth;
+            const courtHeight = court.offsetHeight;
+            
+            players.forEach((player) => {
+                const marker = document.createElement('div');
+                marker.className = 'player-marker';
+                
+                // Add role-specific styling
+                const role = player.player_id || 'player';
+                marker.classList.add(`player-${role.toLowerCase()}`);
+                
+                // Convert coordinates
+                const x = ((player.x + 23) / 46) * courtWidth;
+                const y = ((45 - player.y) / 43) * courtHeight;
+                
+                marker.style.left = `${x}px`;
+                marker.style.top = `${y}px`;
+                
+                // Player label
+                const label = document.createElement('div');
+                label.className = 'player-label';
+                label.textContent = role;
+                marker.appendChild(label);
+                
+                // Enhanced shooting animation handling
+                if (player.is_shooting === true) {  // Explicitly check for true
+                    console.log(`Player ${player.player_id} is shooting! Made: ${player.shot_made}`);
+                    marker.classList.add('shooting');
+                    if (player.shot_made === true) {
+                        marker.classList.add('shot-made');
+                    } else {
+                        marker.classList.add('shot-missed');
+                    }
+                }
+                
+                // Velocity vector
+                if (player.velocity_x !== 0 || player.velocity_y !== 0) {
+                    const vector = document.createElement('div');
+                    vector.className = 'velocity-vector';
+                    
+                    const vectorLength = Math.sqrt(
+                        Math.pow(player.velocity_x, 2) + 
+                        Math.pow(player.velocity_y, 2)
+                    ) * 15;
+                    
+                    const angle = Math.atan2(-player.velocity_y, player.velocity_x);
+                    vector.style.width = `${vectorLength}px`;
+                    vector.style.transform = `rotate(${angle}rad)`;
+                    
+                    marker.appendChild(vector);
+                }
+                
+                court.appendChild(marker);
+            });
+            
+            // Debug output to see shooting states
+            console.log("Player States:", players.map(p => ({
+                id: p.player_id,
+                shooting: p.is_shooting,
+                made: p.shot_made
+            })));
         }
 
         function connectWebSocket() {
@@ -701,8 +918,21 @@ HTML_TEMPLATE = """
                     try {
                         const data = JSON.parse(event.data);
                         addMessage(`Received: ${JSON.stringify(data, null, 2)}`);
+                        
+                        if (data.type === "initial_state" && data.data) {
+                            // Handle initial state
+                            if (data.data.game_state) {
+                                updateGameStats(data.data.game_state);
+                                updatePlayerPositions(data.data.player_positions || []);
+                            }
+                        } else if (data.game_state && data.player_positions) {
+                            // Handle updates
+                            updateGameStats(data.game_state);
+                            updatePlayerPositions(data.player_positions);
+                        }
                     } catch (e) {
-                        addMessage(`Received: ${event.data}`);
+                        addMessage(`Error processing message: ${e.message}`, true);
+                        console.error('Error:', e);
                     }
                 };
 
@@ -710,28 +940,6 @@ HTML_TEMPLATE = """
                 updateStatus('Connection Failed', true);
                 addMessage(`Failed to connect: ${error.message}`, true);
             }
-
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    addMessage(`Received: ${JSON.stringify(data, null, 2)}`);
-                    
-                    if (data.type === "initial_state" && data.data) {
-                        // Handle initial state
-                        if (data.data.game_state) {
-                            updateGameStats(data.data.game_state);
-                            updatePlayerPositions(data.data.player_positions || []);
-                        }
-                    } else if (data.game_state && data.player_positions) {
-                        // Handle updates
-                        updateGameStats(data.game_state);
-                        updatePlayerPositions(data.player_positions);
-                    }
-                } catch (e) {
-                    addMessage(`Error processing message: ${e.message}`, true);
-                    console.error('Error:', e);
-                }
-            };
         }
 
         function disconnectWebSocket() {
@@ -745,100 +953,11 @@ HTML_TEMPLATE = """
 
         // Check health on page load
         checkHealth();
-
-        function updateGameStats(gameState) {
-            document.getElementById('shot-clock').textContent = 
-                Number(gameState.shot_clock).toFixed(1);
-            document.getElementById('game-clock').textContent = 
-                Number(gameState.game_clock).toFixed(1);
-            document.getElementById('score-home').textContent = 
-                gameState.score_home;
-            document.getElementById('quarter').textContent = 
-                gameState.quarter;
-        }
-
-        function updatePlayerPositions(players) {
-            const court = document.getElementById('basketball-court');
-            // Remove only player markers, not court markings
-            const existingMarkers = court.querySelectorAll('.player-marker');
-            existingMarkers.forEach(marker => marker.remove());
-            
-            // Court dimensions
-            const courtWidth = court.offsetWidth;
-            const courtHeight = court.offsetHeight;
-            
-            // Add padding to keep players inside visible area
-            const padding = 20;
-            const effectiveWidth = courtWidth - (padding * 2);
-            const effectiveHeight = courtHeight - (padding * 2);
-            
-            players.forEach((player, index) => {
-                const marker = document.createElement('div');
-                marker.className = 'player-marker';
-                
-                // Normalize coordinates with padding
-                // Convert from -23,23 to padding,width-padding for x
-                const x = padding + ((player.x + 23) / 46) * effectiveWidth;
-                // Convert from 2,45 to height-padding,padding for y (inverted)
-                const y = padding + ((45 - player.y) / 43) * effectiveHeight;
-                
-                // Ensure markers stay within bounds
-                const boundedX = Math.max(padding, Math.min(courtWidth - padding, x));
-                const boundedY = Math.max(padding, Math.min(courtHeight - padding, y));
-                
-                marker.style.left = `${boundedX}px`;
-                marker.style.top = `${boundedY}px`;
-                
-                // Add player ID and position label
-                marker.title = `Player ${player.player_id}\nPosition: (${player.x.toFixed(1)}, ${player.y.toFixed(1)})`;
-                
-                // Add velocity vector if moving
-                if (player.velocity_x !== 0 || player.velocity_y !== 0) {
-                    const vector = document.createElement('div');
-                    vector.className = 'velocity-vector';
-                    
-                    const vectorLength = Math.sqrt(
-                        Math.pow(player.velocity_x, 2) + 
-                        Math.pow(player.velocity_y, 2)
-                    ) * 15; // Scaled down velocity visualization
-                    
-                    const angle = Math.atan2(-player.velocity_y, player.velocity_x);
-                    
-                    vector.style.width = `${vectorLength}px`;
-                    vector.style.transform = `rotate(${angle}rad)`;
-                    
-                    marker.appendChild(vector);
-                }
-                
-                court.appendChild(marker);
-            });
-            
-            // Update debug info with actual coordinates
-            document.getElementById('debug-info').textContent = 
-                `Players: ${players.map(p => 
-                    `${p.player_id}: (${p.x.toFixed(1)}, ${p.y.toFixed(1)})`
-                ).join(', ')}`;
-        }
-
-        // Update the existing onmessage handler in your connectWebSocket function
-        ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                addMessage(`Received: ${JSON.stringify(data, null, 2)}`);
-                
-                // Update visualization if it's a game state update
-                if (data.game_state && data.player_positions) {
-                    updateGameStats(data.game_state);
-                    updatePlayerPositions(data.player_positions);
-                }
-            } catch (e) {
-                addMessage(`Received: ${event.data}`);
-            }
-        };
     </script>
 </body>
-
 </html>
+    
+
 """
 
 if __name__ == "__main__":
